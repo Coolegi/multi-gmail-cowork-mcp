@@ -10,6 +10,7 @@ import { mcpOAuthAuth } from './mcpAuth.js';
 import { createMcpOAuthProvider, mcpResourceUrl, MCP_SCOPE } from './mcpOAuth.js';
 import { createMcpServer } from './mcpServer.js';
 import { createOAuthCallbackRouter } from './oauthCallback.js';
+import { createPublicPagesRouter } from './publicPages.js';
 import { escapeHtml } from './html.js';
 
 const config = loadConfig();
@@ -148,6 +149,12 @@ app.delete('/claude-mcp', requireClaudeMcpAuth, (_req, res) => {
     .status(405)
     .json({ jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed in stateless mode.' }, id: null });
 });
+
+// Public landing page, privacy policy, and terms. Google requires all three on an
+// Authorized Domain before an External OAuth app can leave "Testing" publishing
+// status -- and apps left in "Testing" have every refresh token expired by Google
+// after 7 days. Mounted last so it can never shadow a functional route.
+app.use(createPublicPagesRouter());
 
 app.use((_req, res) => {
   res.status(404).json({ error: 'Not found' });

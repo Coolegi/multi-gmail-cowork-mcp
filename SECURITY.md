@@ -84,6 +84,7 @@ Every route is instead authenticated at the application layer, individually:
 | `POST /admin/accounts/start`, `POST /admin/accounts/:alias/disconnect` | HTTP Basic Auth + same-origin check (`requireSameOrigin`, see "CSRF protection" below) |
 | `GET /oauth/google/callback` | Encrypted, single-purpose, 10-minute state token (`src/oauthState.ts`) |
 | `GET /status` | Nothing — returns only `{"status":"ok"}` |
+| `GET /`, `GET /privacy`, `GET /terms` | Nothing — static public pages (`src/publicPages.ts`). Required by Google to publish the OAuth app; see "Google OAuth verification status". They render no deployment state: no aliases, no connected addresses, no configuration. |
 
 ## Gmail account-linking flow: CSRF, PKCE, and no server-side session
 
@@ -188,6 +189,26 @@ account will see a one-time "Google hasn't verified this app" click-through scre
 expected and does not indicate misconfiguration. Do not attempt to pursue verification for
 this use case — it's a process built for public multi-tenant SaaS, not a self-hosted
 personal tool.
+
+**Publishing is gated on two things that are easy to miss**, and until both are done the
+console shows only a vague "Your app's OAuth configuration is incomplete" banner with the
+**Publish app** button greyed out — while refresh tokens keep silently expiring every 7 days:
+
+1. **Declare the scope.** Google Auth Platform → *Data Access* must list
+   `https://www.googleapis.com/auth/gmail.modify`. This is a separate registration from
+   what the code requests at authorization time; an app works fine in "Testing" with this
+   list empty, because test users can consent to any scope the client asks for, so the gap
+   only surfaces at publish time. Declare exactly the scope the code requests and nothing
+   else — Google's minimum-scope policy is about what you *declare*, not just what you use.
+2. **Provide the three App domain URLs.** Google requires an application home page, a
+   privacy policy link, and a terms-of-service link for *all* external production apps, each
+   on an Authorized Domain. This deployment serves all three itself
+   (`/`, `/privacy`, `/terms` — see `src/publicPages.ts`), so the Cloud Run hostname that is
+   already an Authorized Domain satisfies the requirement with no extra hosting.
+
+After publishing, **reconnect every account.** Refresh tokens issued while the app was in
+"Testing" keep their 7-day expiry; only tokens issued after the switch to "In production"
+are long-lived.
 
 ## Known limitations
 
