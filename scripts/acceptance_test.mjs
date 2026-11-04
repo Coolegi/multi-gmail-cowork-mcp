@@ -360,12 +360,21 @@ async function main() {
   try {
     const list = await mcpCall(accessToken, 'tools/list', {});
     toolNames = (list?.tools || []).map((t) => t.name);
-    const expected = ['list_accounts', 'search_emails', 'get_email', 'search_all_accounts', 'create_draft', 'send_email'];
+    const expected = [
+      'list_accounts',
+      'search_emails',
+      'get_email',
+      'search_all_accounts',
+      'create_draft',
+      'send_email',
+      'list_drafts',
+      'delete_draft',
+    ];
     const missing = expected.filter((t) => !toolNames.includes(t));
-    record('Six tools discovered', missing.length === 0, `found: ${toolNames.join(', ')}`);
+    record('Eight tools discovered', missing.length === 0, `found: ${toolNames.join(', ')}`);
     if (missing.length) return exitSummary();
   } catch (e) {
-    record('Six tools discovered', false, e.message);
+    record('Eight tools discovered', false, e.message);
     return exitSummary();
   }
 
@@ -458,8 +467,9 @@ async function main() {
     record('6. invalid alias -> error, no fallback', false, e.message);
   }
 
-  // --- 7 & 8. Drafts ---
+  // --- 7 & 8. Drafts + list + delete ---
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const createdDrafts = [];
   for (const [label, acct, other] of [['7. draft account A', A, B], ['8. draft account B', B, A]]) {
     try {
       const r = parseToolResult(
@@ -475,9 +485,67 @@ async function main() {
       );
       const ok = !r.isError && r.parsed?.email === acct.email && r.parsed?.draft_id;
       record(label, ok, ok ? `draft_id ${r.parsed.draft_id} in ${acct.email}` : r.text.slice(0, 120));
+      if (ok) createdDrafts.push({ account: acct, draftId: r.parsed.draft_id });
     } catch (e) {
       record(label, false, e.message);
     }
+  }
+
+  for (const created of createdDrafts) {
+    try {
+      const listed = parseToolResult(
+        await mcpCall(accessToken, 'tools/call', {
+          name: 'list_drafts',
+          arguments: { account: created.account.alias, max_results: 50 },
+        }),
+      );
+      const found = (listed.parsed?.drafts || []).some((d) => d.draft_id === created.draftId);
+      record(
+        `list_drafts finds ${created.account.alias} draft`,
+        !listed.isError && found,
+        found ? created.draftId : (listed.text || '').slice(0, 120),
+      );
+    } catch (e) {
+      record(`list_drafts finds ${created.account.alias} draft`, false, e.message);
+    }
+  }
+
+  for (const created of createdDrafts) {
+    try {
+      const deleted = parseToolResult(
+        await mcpCall(accessToken, 'tools/call', {
+          name: 'delete_draft',
+          arguments: { account: created.account.alias, draft_id: created.draftId },
+        }),
+      );
+      const ok = !deleted.isError && deleted.parsed?.deleted_draft_id === created.draftId;
+      record(
+        `delete_draft ${created.account.alias}`,
+        ok,
+        ok ? created.draftId : (deleted.text || '').slice(0, 120),
+      );
+    } catch (e) {
+      record(`delete_draft ${created.account.alias}`, false, e.message);
+    }
+  }
+
+  try {
+    const r = parseToolResult(
+      await mcpCall(accessToken, 'tools/call', {
+        name: 'send_email',
+        arguments: {
+          account: A.alias,
+          to: B.email,
+          subject: `[acceptance-test] invalid-from ${stamp}`,
+          body: 'Should not be sent.',
+          from: 'not-a-sendas-alias@example.com',
+        },
+      }),
+    );
+    const pass = r.isError && /not a send-as alias/i.test(r.text || '');
+    record('invalid from -> clear error, no send', pass, (r.text || '').slice(0, 160));
+  } catch (e) {
+    record('invalid from -> clear error, no send', false, e.message);
   }
 
   // --- 9 & 10. Send (A->B, B->A) + verify arrival + From identity ---
@@ -485,6 +553,9 @@ async function main() {
     record('9. send A->B', true, 'SKIPPED (SKIP_SEND=1)');
     record('10. send B->A', true, 'SKIPPED (SKIP_SEND=1)');
     record('send arrival + From identity', true, 'SKIPPED (SKIP_SEND=1)');
+    record('reply stays in thread', true, 'SKIPPED (SKIP_SEND=1)');
+    record('reply draft stays in thread', true, 'SKIPPED (SKIP_SEND=1)');
+    record('reply draft deleted', true, 'SKIPPED (SKIP_SEND=1)');
   } else {
     const sends = [
       { label: '9. send A->B', from: A, to: B },
@@ -514,6 +585,7 @@ async function main() {
     }
 
     // Verify arrival + correct From by reading the recipient account.
+    let arrivedOnB = null;
     if (bothSent) {
       let arrivalOk = true;
       const checks = [
@@ -521,7 +593,7 @@ async function main() {
         { recipient: A, sender: B },
       ];
       for (const c of checks) {
-        let found = false;
+        let found = null;
         // Gmail delivery + indexing can lag a few seconds; retry briefly.
         for (let attempt = 0; attempt < 6 && !found; attempt++) {
           await sleep(5000 * (attempt + 1));
@@ -537,16 +609,86 @@ async function main() {
               }),
             );
             const hit = (r.parsed?.results || []).find((m) => m.from.toLowerCase().includes(c.sender.email.toLowerCase()));
-            if (hit) found = true;
+            if (hit) found = hit;
           } catch {
             /* retry */
           }
         }
         if (!found) arrivalOk = false;
+        else if (c.recipient === B) arrivedOnB = found;
       }
       record('send arrival + From identity', arrivalOk, arrivalOk ? 'both test emails arrived with correct sender' : 'could not confirm arrival (may need a longer wait)');
     } else {
       record('send arrival + From identity', false, 'a send failed; arrival not checked');
+    }
+
+    if (arrivedOnB) {
+      try {
+        const reply = parseToolResult(
+          await mcpCall(accessToken, 'tools/call', {
+            name: 'send_email',
+            arguments: {
+              account: B.alias,
+              reply_to_message_id: arrivedOnB.id,
+              body: `Harmless automated acceptance-test reply in-thread. From ${B.email}.`,
+            },
+          }),
+        );
+        const ok =
+          !reply.isError &&
+          reply.parsed?.thread_id === arrivedOnB.threadId &&
+          reply.parsed?.from === B.email;
+        record(
+          'reply stays in thread',
+          ok,
+          ok
+            ? `from ${reply.parsed.from} thread_id ${reply.parsed.thread_id}`
+            : (reply.text || '').slice(0, 160),
+        );
+      } catch (e) {
+        record('reply stays in thread', false, e.message);
+      }
+
+      try {
+        const draft = parseToolResult(
+          await mcpCall(accessToken, 'tools/call', {
+            name: 'create_draft',
+            arguments: {
+              account: B.alias,
+              reply_to_message_id: arrivedOnB.id,
+              body: `Harmless automated acceptance-test reply draft. From ${B.email}.`,
+            },
+          }),
+        );
+        const ok = !draft.isError && draft.parsed?.draft_id && draft.parsed?.thread_id === arrivedOnB.threadId;
+        record(
+          'reply draft stays in thread',
+          ok,
+          ok ? `draft_id ${draft.parsed.draft_id} thread_id ${draft.parsed.thread_id}` : (draft.text || '').slice(0, 160),
+        );
+        if (ok) {
+          const deleted = parseToolResult(
+            await mcpCall(accessToken, 'tools/call', {
+              name: 'delete_draft',
+              arguments: { account: B.alias, draft_id: draft.parsed.draft_id },
+            }),
+          );
+          record(
+            'reply draft deleted',
+            !deleted.isError && deleted.parsed?.deleted_draft_id === draft.parsed.draft_id,
+            !deleted.isError ? deleted.parsed.deleted_draft_id : (deleted.text || '').slice(0, 160),
+          );
+        } else {
+          record('reply draft deleted', false, 'reply draft was not created');
+        }
+      } catch (e) {
+        record('reply draft stays in thread', false, e.message);
+        record('reply draft deleted', false, e.message);
+      }
+    } else if (!skipSend) {
+      record('reply stays in thread', false, 'original message did not arrive on B; reply not attempted');
+      record('reply draft stays in thread', false, 'original message did not arrive on B; reply draft not attempted');
+      record('reply draft deleted', false, 'original message did not arrive on B; reply draft not attempted');
     }
   }
 

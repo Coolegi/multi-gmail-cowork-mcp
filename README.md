@@ -25,6 +25,8 @@ Ask Claude things like:
 - "Search all connected Gmail accounts for 'invoice 4831'."
 - "Read the latest email from ACH Works, whichever account received it."
 - "Which of my Gmail accounts received an email from John yesterday?"
+- "Reply to that client email in the same thread, from the alias they wrote to."
+- "Draft a reply from mail@example.com, then delete the draft if I change my mind."
 
 Every result is explicitly attributed to the account alias and email address it came from.
 If you ask for an account that isn't connected, or whose authorization has expired, you get
@@ -32,7 +34,8 @@ a clear error — this server never silently substitutes a different account.
 
 ## What this is not
 
-Gmail only. No Calendar, Drive, Docs, Sheets, or Contacts. No permanent-delete tool. No
+Gmail only. No Calendar, Drive, Docs, Sheets, or Contacts. No tool that permanently
+deletes sent or received mail (`delete_draft` does permanently remove drafts). No
 shared backend, no central account, no telemetry.
 
 ## Privacy model — who can see your email
@@ -173,9 +176,9 @@ alias-specific search for each account and `search_all_accounts` to verify attri
 ## Verify your deployment
 
 `scripts/acceptance_test.mjs` proves every tool works end-to-end against your own
-deployment — account isolation, no-fallback on a bad alias, drafts, and send with
-arrival and correct `From` identity. It performs the full MCP OAuth flow as a real
-remote client and never prints tokens:
+deployment — account isolation, no-fallback on a bad alias, drafts, list/delete drafts,
+send with arrival and correct `From` identity, and a threaded reply. It performs the
+full MCP OAuth flow as a real remote client and never prints tokens:
 
 ```bash
 MCP_BASE_URL=https://your-service.run.app \
@@ -212,12 +215,22 @@ with the same alias — it overwrites the old record only after successful Googl
 
 ## Write tools and safety
 
-The deployed server exposes `create_draft` and `send_email`. Both require an explicit
-connected-account alias and never fall back to another account. `send_email` always sends
-from the selected Gmail identity; the result includes that verified address. The tools use
-`gmail.modify`, not the broader `mail.google.com` scope, and there is no permanent-delete
-tool. Claude connector permissions should allow read tools automatically while keeping
-`create_draft` and `send_email` set to **Needs approval**.
+The deployed server exposes `create_draft`, `send_email`, `list_drafts`, and `delete_draft`.
+All require an explicit connected-account alias and never fall back to another account.
+Without new parameters, `send_email` still sends from Gmail's default send-as for that
+account (backwards compatible). Optional `reply_to_message_id` replies in the original
+thread (Gmail `threadId`, `In-Reply-To`, `References`, English `Re:` subject — `Odp:`,
+`AW:`, and `Fwd:` are not treated as already-replied) and sends from the alias the
+original arrived at, looked up via `users.settings.sendAs`. A reply to a received
+message goes to the sender only (not reply-all). Following up on a message this account
+itself sent reuses that From alias and the original To/Cc. Optional `from` overrides
+From with a verified send-as alias; unknown or unverified addresses are rejected.
+`delete_draft` calls Gmail `drafts.delete`, which **permanently deletes the draft**
+(not move-to-Trash) and cannot delete sent or received mail. The tools use
+`gmail.modify`, not the broader `mail.google.com` scope, and listing send-as aliases is
+covered by that same grant (no extra OAuth scope). Claude connector permissions should
+allow read tools and `list_drafts` automatically while keeping `create_draft`,
+`send_email`, and `delete_draft` set to **Needs approval**.
 
 ## Updating and rotating
 
