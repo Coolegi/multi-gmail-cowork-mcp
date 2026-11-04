@@ -21,10 +21,11 @@ Google  <->  Your Google Cloud deployment  <->  Claude / Anthropic
   It is provisioned and owned entirely by you, in your own GCP project, with your own
   billing.
 - **Claude / Anthropic** calls the MCP tools you expose (`list_accounts`, `search_emails`,
-  `get_email`, `search_all_accounts`) and sees whatever those tools return — sender,
-  subject, snippets, and bodies for messages you ask Claude to look at. It never sees
-  Gmail refresh tokens or your admin password. Claude receives only the OAuth access token
-  issued for the MCP resource and never receives Gmail credentials.
+  `get_email`, `search_all_accounts`, and the write tools when enabled) and sees whatever
+  those tools return — sender, subject, snippets, and bodies for messages you ask Claude
+  to look at. It never sees Gmail refresh tokens or your admin password. Claude receives
+  only the OAuth access token issued for the MCP resource and never receives Gmail
+  credentials.
 - **No one else.** There is no analytics, telemetry, crash reporting, or logging service
   in this project. The repository author does not operate any shared backend and receives
   no data from your deployment — every deployment is fully independent (see "One-user
@@ -221,6 +222,8 @@ are long-lived.
 - `search_all_accounts` and `search_emails` cap results and return metadata/snippets, not
   full bodies, to keep tool responses small — but an authorized OAuth client can read every
   connected account's mail via `get_email`.
+- `delete_draft` removes only a Gmail draft. There is still no tool that permanently
+  deletes sent or received messages.
 - Dependencies are kept minimal by design (see README) but you are responsible for keeping
   them updated (`npm audit`, `npm outdated`) on your own deployment.
 

@@ -94,7 +94,7 @@ ${message ? `<p class="msg">${escapeHtml(message)}</p>` : ''}
     <li>Claude opens this deployment's <strong>Authorize MCP access</strong> page. Sign in with username <code>admin</code> and the admin password from your Secret Manager, then approve.</li>
     <li>Ask Claude to <code>list_accounts</code> to confirm the connection.</li>
   </ol>
-  <p class="muted">Recommended tool permissions: read tools Always allow; <code>create_draft</code> user preference; <code>send_email</code> Needs approval.</p>
+  <p class="muted">Recommended tool permissions: read tools and <code>list_drafts</code> Always allow; <code>create_draft</code> user preference; <code>send_email</code> and <code>delete_draft</code> Needs approval.</p>
 </details>
 `;
   return pageShell('Multi-Gmail MCP — Admin', body);

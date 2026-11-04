@@ -1,5 +1,14 @@
 import type { OAuth2Client } from 'google-auth-library';
+import {
+  resolveCompose,
+  type ComposeMessageInput,
+  type ReplyOriginal,
+  type SendAsAlias,
+} from './compose.js';
 import { clientForRefreshToken } from './googleOAuth.js';
+
+export type { ComposeMessageInput } from './compose.js';
+export { UnknownSendAsError } from './compose.js';
 
 const GMAIL_BASE = 'https://gmail.googleapis.com/gmail/v1/users/me';
 
@@ -30,19 +39,48 @@ interface GmailListResponse {
   resultSizeEstimate?: number;
 }
 
-// Gmail message/thread IDs are hex strings in practice, but this is deliberately a
+interface GmailSendAs {
+  sendAsEmail?: string;
+  displayName?: string;
+  isDefault?: boolean;
+  isPrimary?: boolean;
+  verificationStatus?: string;
+}
+
+interface GmailSendAsListResponse {
+  sendAs?: GmailSendAs[];
+}
+
+interface GmailDraftListResponse {
+  drafts?: { id: string; message?: { id?: string; threadId?: string } }[];
+  nextPageToken?: string;
+  resultSizeEstimate?: number;
+}
+
+interface GmailDraft {
+  id: string;
+  message?: GmailMessage;
+}
+
+// Gmail message/thread/draft IDs are hex strings in practice, but this is deliberately a
 // little more permissive while still rejecting anything that could act as a path
 // separator or traversal segment when interpolated into a Gmail API URL path.
-const MESSAGE_ID_PATTERN = /^[a-zA-Z0-9_-]{1,100}$/;
+const GMAIL_ID_PATTERN = /^[a-zA-Z0-9_-]{1,100}$/;
 
-export class InvalidMessageIdError extends Error {
+export class InvalidGmailIdError extends Error {
+  constructor(kind: string, id: string) {
+    super(`Invalid Gmail ${kind} ID: "${id}".`);
+  }
+}
+
+export class InvalidMessageIdError extends InvalidGmailIdError {
   constructor(messageId: string) {
-    super(`Invalid Gmail message ID: "${messageId}".`);
+    super('message', messageId);
   }
 }
 
 /**
- * Validates AND percent-encodes a caller-supplied Gmail message ID before it is
+ * Validates AND percent-encodes a caller-supplied Gmail id before it is
  * interpolated into a request path. Defense in depth against path-segment
  * injection (e.g. "../settings/forwardingAddresses") reaching a Gmail API
  * endpoint other than the one a tool is meant to call — validated here even
@@ -50,11 +88,11 @@ export class InvalidMessageIdError extends Error {
  * IDs can originate from email content an LLM just read (indirect prompt
  * injection), not only from a manually typed argument.
  */
-function encodeMessageId(messageId: string): string {
-  if (!MESSAGE_ID_PATTERN.test(messageId)) {
-    throw new InvalidMessageIdError(messageId);
+function encodeGmailId(id: string, kind: 'message' | 'draft'): string {
+  if (!GMAIL_ID_PATTERN.test(id)) {
+    throw new InvalidGmailIdError(kind, id);
   }
-  return encodeURIComponent(messageId);
+  return encodeURIComponent(id);
 }
 
 export class GmailApiError extends Error {
@@ -70,7 +108,7 @@ async function gmailFetch<T>(
   client: OAuth2Client,
   path: string,
   params: Record<string, string | number | string[] | undefined>,
-  request: { method?: 'GET' | 'POST'; body?: unknown } = {},
+  request: { method?: 'GET' | 'POST' | 'DELETE'; body?: unknown } = {},
 ): Promise<T> {
   const { token } = await client.getAccessToken();
   if (!token) throw new Error('Failed to obtain a Gmail access token.');
@@ -90,9 +128,22 @@ async function gmailFetch<T>(
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   const res = await fetch(url, { method: request.method ?? 'GET', headers, body });
   if (!res.ok) {
-    throw new GmailApiError(`Gmail API request to ${path} failed with HTTP ${res.status}`, res.status);
+    let detail = '';
+    try {
+      const errBody = (await res.json()) as { error?: { message?: string } };
+      const gmailMessage = errBody?.error?.message;
+      if (typeof gmailMessage === 'string' && gmailMessage.length > 0 && gmailMessage.length < 300) {
+        detail = `: ${gmailMessage}`;
+      }
+    } catch {
+      // Keep the generic status error when the body isn't JSON.
+    }
+    throw new GmailApiError(`Gmail API request to ${path} failed with HTTP ${res.status}${detail}`, res.status);
   }
-  return (await res.json()) as T;
+  if (res.status === 204) return undefined as T;
+  const text = await res.text();
+  if (!text) return undefined as T;
+  return JSON.parse(text) as T;
 }
 
 function headerLookup(headers: GmailHeader[] | undefined, name: string): string {
@@ -152,6 +203,7 @@ export interface SearchResultItem {
 }
 
 const METADATA_HEADERS = ['From', 'To', 'Subject', 'Date'];
+const REPLY_HEADERS = ['From', 'To', 'Cc', 'Delivered-To', 'Reply-To', 'Subject', 'Message-ID', 'References'];
 
 export async function searchMessages(
   refreshToken: string,
@@ -166,7 +218,7 @@ export async function searchMessages(
 
   const messages = await Promise.all(
     ids.map((m) =>
-      gmailFetch<GmailMessage>(client, `/messages/${encodeMessageId(m.id)}`, {
+      gmailFetch<GmailMessage>(client, `/messages/${encodeGmailId(m.id, 'message')}`, {
         format: 'metadata',
         metadataHeaders: METADATA_HEADERS,
       }),
@@ -191,6 +243,8 @@ export interface FullMessage {
   from: string;
   to: string;
   cc: string;
+  replyTo: string;
+  deliveredTo: string;
   subject: string;
   date: string;
   snippet: string;
@@ -200,7 +254,9 @@ export interface FullMessage {
 
 export async function getMessage(refreshToken: string, messageId: string): Promise<FullMessage> {
   const client = clientForRefreshToken(refreshToken);
-  const msg = await gmailFetch<GmailMessage>(client, `/messages/${encodeMessageId(messageId)}`, { format: 'full' });
+  const msg = await gmailFetch<GmailMessage>(client, `/messages/${encodeGmailId(messageId, 'message')}`, {
+    format: 'full',
+  });
   const body = extractBody(msg.payload);
 
   return {
@@ -210,6 +266,8 @@ export async function getMessage(refreshToken: string, messageId: string): Promi
     from: headerLookup(msg.payload?.headers, 'From'),
     to: headerLookup(msg.payload?.headers, 'To'),
     cc: headerLookup(msg.payload?.headers, 'Cc'),
+    replyTo: headerLookup(msg.payload?.headers, 'Reply-To'),
+    deliveredTo: headerLookup(msg.payload?.headers, 'Delivered-To'),
     subject: headerLookup(msg.payload?.headers, 'Subject'),
     date: headerLookup(msg.payload?.headers, 'Date'),
     snippet: msg.snippet ?? '',
@@ -218,84 +276,143 @@ export async function getMessage(refreshToken: string, messageId: string): Promi
   };
 }
 
-export interface ComposeMessageInput {
-  to?: string;
-  cc?: string;
-  bcc?: string;
-  subject?: string;
-  body: string;
-}
-
 export interface GmailWriteResult {
   id?: string;
   threadId?: string;
   labelIds?: string[];
+  from?: string;
 }
 
 export interface GmailDraftResult {
   id?: string;
   message?: GmailWriteResult;
+  from?: string;
 }
 
-function rejectHeaderInjection(value: string, field: string): void {
-  if (/[\r\n]/.test(value)) throw new Error(`${field} must not contain line breaks.`);
+export interface DraftListItem {
+  draftId: string;
+  messageId?: string;
+  threadId?: string;
+  from: string;
+  to: string;
+  cc: string;
+  subject: string;
+  date: string;
+  snippet: string;
 }
 
-function normalizeRecipients(value: string | undefined, field: string, required: boolean): string | undefined {
-  if (!value) {
-    if (required) throw new Error(`${field} is required.`);
-    return undefined;
-  }
-  rejectHeaderInjection(value, field);
-  const recipients = value
-    .split(',')
-    .map((recipient) => recipient.trim())
-    .filter(Boolean);
-  if (recipients.length === 0 || recipients.some((recipient) => !/^[^@\s,]+@[^@\s,]+\.[^@\s,]+$/.test(recipient))) {
-    throw new Error(`${field} must contain one or more comma-separated email addresses.`);
-  }
-  return recipients.join(', ');
+async function listSendAs(client: OAuth2Client): Promise<SendAsAlias[]> {
+  const res = await gmailFetch<GmailSendAsListResponse>(client, '/settings/sendAs', {});
+  return (res.sendAs ?? [])
+    .filter((a): a is GmailSendAs & { sendAsEmail: string } => Boolean(a.sendAsEmail))
+    .map((a) => ({
+      sendAsEmail: a.sendAsEmail,
+      displayName: a.displayName,
+      isDefault: a.isDefault,
+      isPrimary: a.isPrimary,
+      verificationStatus: a.verificationStatus,
+    }));
 }
 
-function encodeSubject(subject: string): string {
-  rejectHeaderInjection(subject, 'subject');
-  if (/^[\x20-\x7e]*$/.test(subject)) return subject;
-  return `=?UTF-8?B?${Buffer.from(subject, 'utf8').toString('base64')}?=`;
+function replyOriginalFromMessage(msg: GmailMessage): ReplyOriginal {
+  return {
+    threadId: msg.threadId,
+    from: headerLookup(msg.payload?.headers, 'From'),
+    replyTo: headerLookup(msg.payload?.headers, 'Reply-To'),
+    to: headerLookup(msg.payload?.headers, 'To'),
+    cc: headerLookup(msg.payload?.headers, 'Cc'),
+    deliveredTo: headerLookup(msg.payload?.headers, 'Delivered-To'),
+    subject: headerLookup(msg.payload?.headers, 'Subject'),
+    messageIdHeader: headerLookup(msg.payload?.headers, 'Message-ID'),
+    references: headerLookup(msg.payload?.headers, 'References'),
+  };
 }
 
-function buildRawMessage(input: ComposeMessageInput, requireRecipient: boolean): string {
-  if (input.body.length > 100_000) throw new Error('body is too large (maximum 100,000 characters).');
-  const to = normalizeRecipients(input.to, 'to', requireRecipient);
-  const cc = normalizeRecipients(input.cc, 'cc', false);
-  const bcc = normalizeRecipients(input.bcc, 'bcc', false);
-  const subject = encodeSubject(input.subject ?? '');
-  const body = input.body.replace(/\r\n?|\n/g, '\r\n');
-  const headers = [
-    ...(to ? [`To: ${to}`] : []),
-    ...(cc ? [`Cc: ${cc}`] : []),
-    ...(bcc ? [`Bcc: ${bcc}`] : []),
-    `Subject: ${subject}`,
-    'MIME-Version: 1.0',
-    'Content-Type: text/plain; charset="UTF-8"',
-    'Content-Transfer-Encoding: 8bit',
-  ];
-  return Buffer.from(`${headers.join('\r\n')}\r\n\r\n${body}`, 'utf8').toString('base64url');
+async function fetchReplyOriginal(client: OAuth2Client, messageId: string): Promise<ReplyOriginal> {
+  const msg = await gmailFetch<GmailMessage>(client, `/messages/${encodeGmailId(messageId, 'message')}`, {
+    format: 'metadata',
+    metadataHeaders: REPLY_HEADERS,
+  });
+  return replyOriginalFromMessage(msg);
+}
+
+async function prepareOutbound(
+  client: OAuth2Client,
+  input: ComposeMessageInput,
+  requireRecipient: boolean,
+): Promise<{ raw: string; threadId?: string; fromAddress?: string }> {
+  const needsSendAs = Boolean(input.from || input.replyToMessageId);
+  const original = input.replyToMessageId ? await fetchReplyOriginal(client, input.replyToMessageId) : undefined;
+  const sendAs = needsSendAs ? await listSendAs(client) : [];
+  return resolveCompose(input, { requireRecipient, original, sendAs });
 }
 
 export async function sendMessage(refreshToken: string, input: ComposeMessageInput): Promise<GmailWriteResult> {
-  return gmailFetch<GmailWriteResult>(
-    clientForRefreshToken(refreshToken),
+  const client = clientForRefreshToken(refreshToken);
+  const prepared = await prepareOutbound(client, input, true);
+  const sent = await gmailFetch<GmailWriteResult>(
+    client,
     '/messages/send',
     {},
-    { method: 'POST', body: { raw: buildRawMessage(input, true) } },
+    {
+      method: 'POST',
+      body: { raw: prepared.raw, ...(prepared.threadId ? { threadId: prepared.threadId } : {}) },
+    },
   );
+  return { ...sent, from: prepared.fromAddress };
 }
 
 export async function createDraft(refreshToken: string, input: ComposeMessageInput): Promise<GmailDraftResult> {
-  return gmailFetch<GmailDraftResult>(
-    clientForRefreshToken(refreshToken),
+  const client = clientForRefreshToken(refreshToken);
+  const prepared = await prepareOutbound(client, input, false);
+  const draft = await gmailFetch<GmailDraftResult>(
+    client,
     '/drafts',
     {},
-    { method: 'POST', body: { message: { raw: buildRawMessage(input, false) } } },
+    {
+      method: 'POST',
+      body: {
+        message: { raw: prepared.raw, ...(prepared.threadId ? { threadId: prepared.threadId } : {}) },
+      },
+    },
+  );
+  return { ...draft, from: prepared.fromAddress };
+}
+
+export async function listDrafts(refreshToken: string, maxResults: number): Promise<DraftListItem[]> {
+  const client = clientForRefreshToken(refreshToken);
+  const capped = Math.min(Math.max(Math.floor(maxResults), 1), 50);
+  const list = await gmailFetch<GmailDraftListResponse>(client, '/drafts', { maxResults: capped });
+  const drafts = list.drafts ?? [];
+
+  const hydrated = await Promise.all(
+    drafts.map(async (d) => {
+      const full = await gmailFetch<GmailDraft>(client, `/drafts/${encodeGmailId(d.id, 'draft')}`, {
+        format: 'full',
+      });
+      const headers = full.message?.payload?.headers;
+      return {
+        draftId: full.id,
+        messageId: full.message?.id,
+        threadId: full.message?.threadId,
+        from: headerLookup(headers, 'From'),
+        to: headerLookup(headers, 'To'),
+        cc: headerLookup(headers, 'Cc'),
+        subject: headerLookup(headers, 'Subject'),
+        date: headerLookup(headers, 'Date'),
+        snippet: full.message?.snippet ?? '',
+      };
+    }),
+  );
+
+  return hydrated;
+}
+
+export async function deleteDraft(refreshToken: string, draftId: string): Promise<void> {
+  await gmailFetch<void>(
+    clientForRefreshToken(refreshToken),
+    `/drafts/${encodeGmailId(draftId, 'draft')}`,
+    {},
+    { method: 'DELETE' },
   );
 }
