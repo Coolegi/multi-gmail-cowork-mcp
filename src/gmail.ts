@@ -5,10 +5,29 @@ import {
   type ReplyOriginal,
   type SendAsAlias,
 } from './compose.js';
-import { clientForRefreshToken } from './googleOAuth.js';
+import { clientForRefreshToken as liveClientForRefreshToken } from './googleOAuth.js';
 
 export type { ComposeMessageInput } from './compose.js';
-export { UnknownSendAsError } from './compose.js';
+export { UnknownSendAsError, UnverifiedSendAsError } from './compose.js';
+
+async function liveTokenFromClient(client: OAuth2Client): Promise<string> {
+  const { token } = await client.getAccessToken();
+  if (!token) throw new Error('Failed to obtain a Gmail access token.');
+  return token;
+}
+
+/** Mutable HTTP hooks so unit tests can stub Gmail without OAuth or network. */
+export const gmailHttp = {
+  fetch: globalThis.fetch.bind(globalThis) as typeof fetch,
+  clientForRefreshToken: liveClientForRefreshToken,
+  tokenFromClient: liveTokenFromClient,
+};
+
+export function resetGmailHttp(): void {
+  gmailHttp.fetch = globalThis.fetch.bind(globalThis) as typeof fetch;
+  gmailHttp.clientForRefreshToken = liveClientForRefreshToken;
+  gmailHttp.tokenFromClient = liveTokenFromClient;
+}
 
 const GMAIL_BASE = 'https://gmail.googleapis.com/gmail/v1/users/me';
 
@@ -110,8 +129,7 @@ async function gmailFetch<T>(
   params: Record<string, string | number | string[] | undefined>,
   request: { method?: 'GET' | 'POST' | 'DELETE'; body?: unknown } = {},
 ): Promise<T> {
-  const { token } = await client.getAccessToken();
-  if (!token) throw new Error('Failed to obtain a Gmail access token.');
+  const token = await gmailHttp.tokenFromClient(client);
 
   const url = new URL(`${GMAIL_BASE}${path}`);
   for (const [key, value] of Object.entries(params)) {
@@ -126,7 +144,7 @@ async function gmailFetch<T>(
   const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
   const body = request.body === undefined ? undefined : JSON.stringify(request.body);
   if (body !== undefined) headers['Content-Type'] = 'application/json';
-  const res = await fetch(url, { method: request.method ?? 'GET', headers, body });
+  const res = await gmailHttp.fetch(url, { method: request.method ?? 'GET', headers, body });
   if (!res.ok) {
     let detail = '';
     try {
@@ -149,6 +167,29 @@ async function gmailFetch<T>(
 function headerLookup(headers: GmailHeader[] | undefined, name: string): string {
   const found = headers?.find((h) => (h.name ?? '').toLowerCase() === name.toLowerCase());
   return found?.value ?? '';
+}
+
+function headerLookupAll(headers: GmailHeader[] | undefined, name: string): string[] {
+  return (headers ?? [])
+    .filter((h) => (h.name ?? '').toLowerCase() === name.toLowerCase())
+    .map((h) => h.value ?? '')
+    .filter((value) => value.length > 0);
+}
+
+async function mapPool<T, R>(items: T[], concurrency: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  if (items.length === 0) return [];
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    for (;;) {
+      const i = next;
+      next += 1;
+      if (i >= items.length) return;
+      results[i] = await fn(items[i]!);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(Math.max(concurrency, 1), items.length) }, () => worker()));
+  return results;
 }
 
 function decodeBase64Url(data: string): string {
@@ -203,14 +244,26 @@ export interface SearchResultItem {
 }
 
 const METADATA_HEADERS = ['From', 'To', 'Subject', 'Date'];
-const REPLY_HEADERS = ['From', 'To', 'Cc', 'Delivered-To', 'Reply-To', 'Subject', 'Message-ID', 'References'];
+const REPLY_HEADERS = [
+  'From',
+  'To',
+  'Cc',
+  'Delivered-To',
+  'Reply-To',
+  'Subject',
+  'Message-ID',
+  'References',
+  'In-Reply-To',
+];
+const DRAFT_HEADERS = ['From', 'To', 'Cc', 'Subject', 'Date'];
+const DRAFT_HYDRATE_CONCURRENCY = 10;
 
 export async function searchMessages(
   refreshToken: string,
   query: string,
   maxResults: number,
 ): Promise<SearchResultItem[]> {
-  const client = clientForRefreshToken(refreshToken);
+  const client = gmailHttp.clientForRefreshToken(refreshToken);
   const capped = Math.min(Math.max(Math.floor(maxResults), 1), 50);
 
   const list = await gmailFetch<GmailListResponse>(client, '/messages', { q: query, maxResults: capped });
@@ -253,7 +306,7 @@ export interface FullMessage {
 }
 
 export async function getMessage(refreshToken: string, messageId: string): Promise<FullMessage> {
-  const client = clientForRefreshToken(refreshToken);
+  const client = gmailHttp.clientForRefreshToken(refreshToken);
   const msg = await gmailFetch<GmailMessage>(client, `/messages/${encodeGmailId(messageId, 'message')}`, {
     format: 'full',
   });
@@ -267,7 +320,7 @@ export async function getMessage(refreshToken: string, messageId: string): Promi
     to: headerLookup(msg.payload?.headers, 'To'),
     cc: headerLookup(msg.payload?.headers, 'Cc'),
     replyTo: headerLookup(msg.payload?.headers, 'Reply-To'),
-    deliveredTo: headerLookup(msg.payload?.headers, 'Delivered-To'),
+    deliveredTo: headerLookupAll(msg.payload?.headers, 'Delivered-To').join(', '),
     subject: headerLookup(msg.payload?.headers, 'Subject'),
     date: headerLookup(msg.payload?.headers, 'Date'),
     snippet: msg.snippet ?? '',
@@ -321,10 +374,11 @@ function replyOriginalFromMessage(msg: GmailMessage): ReplyOriginal {
     replyTo: headerLookup(msg.payload?.headers, 'Reply-To'),
     to: headerLookup(msg.payload?.headers, 'To'),
     cc: headerLookup(msg.payload?.headers, 'Cc'),
-    deliveredTo: headerLookup(msg.payload?.headers, 'Delivered-To'),
+    deliveredTo: headerLookupAll(msg.payload?.headers, 'Delivered-To').join(', '),
     subject: headerLookup(msg.payload?.headers, 'Subject'),
     messageIdHeader: headerLookup(msg.payload?.headers, 'Message-ID'),
     references: headerLookup(msg.payload?.headers, 'References'),
+    inReplyToHeader: headerLookup(msg.payload?.headers, 'In-Reply-To'),
   };
 }
 
@@ -341,14 +395,13 @@ async function prepareOutbound(
   input: ComposeMessageInput,
   requireRecipient: boolean,
 ): Promise<{ raw: string; threadId?: string; fromAddress?: string }> {
-  const needsSendAs = Boolean(input.from || input.replyToMessageId);
   const original = input.replyToMessageId ? await fetchReplyOriginal(client, input.replyToMessageId) : undefined;
-  const sendAs = needsSendAs ? await listSendAs(client) : [];
+  const sendAs = await listSendAs(client);
   return resolveCompose(input, { requireRecipient, original, sendAs });
 }
 
 export async function sendMessage(refreshToken: string, input: ComposeMessageInput): Promise<GmailWriteResult> {
-  const client = clientForRefreshToken(refreshToken);
+  const client = gmailHttp.clientForRefreshToken(refreshToken);
   const prepared = await prepareOutbound(client, input, true);
   const sent = await gmailFetch<GmailWriteResult>(
     client,
@@ -363,7 +416,7 @@ export async function sendMessage(refreshToken: string, input: ComposeMessageInp
 }
 
 export async function createDraft(refreshToken: string, input: ComposeMessageInput): Promise<GmailDraftResult> {
-  const client = clientForRefreshToken(refreshToken);
+  const client = gmailHttp.clientForRefreshToken(refreshToken);
   const prepared = await prepareOutbound(client, input, false);
   const draft = await gmailFetch<GmailDraftResult>(
     client,
@@ -380,37 +433,34 @@ export async function createDraft(refreshToken: string, input: ComposeMessageInp
 }
 
 export async function listDrafts(refreshToken: string, maxResults: number): Promise<DraftListItem[]> {
-  const client = clientForRefreshToken(refreshToken);
+  const client = gmailHttp.clientForRefreshToken(refreshToken);
   const capped = Math.min(Math.max(Math.floor(maxResults), 1), 50);
   const list = await gmailFetch<GmailDraftListResponse>(client, '/drafts', { maxResults: capped });
   const drafts = list.drafts ?? [];
 
-  const hydrated = await Promise.all(
-    drafts.map(async (d) => {
-      const full = await gmailFetch<GmailDraft>(client, `/drafts/${encodeGmailId(d.id, 'draft')}`, {
-        format: 'full',
-      });
-      const headers = full.message?.payload?.headers;
-      return {
-        draftId: full.id,
-        messageId: full.message?.id,
-        threadId: full.message?.threadId,
-        from: headerLookup(headers, 'From'),
-        to: headerLookup(headers, 'To'),
-        cc: headerLookup(headers, 'Cc'),
-        subject: headerLookup(headers, 'Subject'),
-        date: headerLookup(headers, 'Date'),
-        snippet: full.message?.snippet ?? '',
-      };
-    }),
-  );
-
-  return hydrated;
+  return mapPool(drafts, DRAFT_HYDRATE_CONCURRENCY, async (d) => {
+    const full = await gmailFetch<GmailDraft>(client, `/drafts/${encodeGmailId(d.id, 'draft')}`, {
+      format: 'metadata',
+      metadataHeaders: DRAFT_HEADERS,
+    });
+    const headers = full.message?.payload?.headers;
+    return {
+      draftId: full.id,
+      messageId: full.message?.id,
+      threadId: full.message?.threadId,
+      from: headerLookup(headers, 'From'),
+      to: headerLookup(headers, 'To'),
+      cc: headerLookup(headers, 'Cc'),
+      subject: headerLookup(headers, 'Subject'),
+      date: headerLookup(headers, 'Date'),
+      snippet: full.message?.snippet ?? '',
+    };
+  });
 }
 
 export async function deleteDraft(refreshToken: string, draftId: string): Promise<void> {
   await gmailFetch<void>(
-    clientForRefreshToken(refreshToken),
+    gmailHttp.clientForRefreshToken(refreshToken),
     `/drafts/${encodeGmailId(draftId, 'draft')}`,
     {},
     { method: 'DELETE' },

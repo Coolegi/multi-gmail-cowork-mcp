@@ -2,19 +2,46 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
   buildReferences,
+  encodeRfc2047,
   extractEmails,
+  extractMessageIds,
   findSendAs,
   formatMailbox,
+  normalizeEmailForMatch,
   pickSendAsForReply,
   prefixRe,
   resolveCompose,
   UnknownSendAsError,
+  UnverifiedSendAsError,
   type ReplyOriginal,
   type SendAsAlias,
 } from '../src/compose.js';
 
 function decodeRaw(raw: string): string {
   return Buffer.from(raw, 'base64url').toString('utf8');
+}
+
+function decodeEncodedWords(value: string): string {
+  return value
+    .replace(/\r\n[ \t]+/g, '')
+    .replace(/=\?UTF-8\?B\?([A-Za-z0-9+/=]+)\?=/g, (_m, b64: string) => Buffer.from(b64, 'base64').toString('utf8'));
+}
+
+function headerBlock(raw: string): string {
+  return decodeRaw(raw).split('\r\n\r\n')[0] ?? '';
+}
+
+function headerValue(raw: string, name: string): string {
+  const block = headerBlock(raw);
+  const lines = block.split('\r\n');
+  const start = lines.findIndex((l) => l.toLowerCase().startsWith(`${name.toLowerCase()}: `));
+  if (start < 0) return '';
+  let value = lines[start]!.slice(name.length + 2);
+  for (let i = start + 1; i < lines.length; i++) {
+    if (!/^[ \t]/.test(lines[i]!)) break;
+    value += `\r\n${lines[i]}`;
+  }
+  return value;
 }
 
 const primary: SendAsAlias = {
@@ -45,7 +72,7 @@ const originalToAlias: ReplyOriginal = {
   replyTo: '',
   to: 'Ondrej <mail@ondrejspulak.cz>',
   cc: 'cc-other@example.com',
-  deliveredTo: 'mail@ondrejspulak.cz',
+  deliveredTo: 'spulak.ondrej@gmail.com, mail@ondrejspulak.cz',
   subject: 'Question about the quote',
   messageIdHeader: '<orig@mail.gmail.com>',
   references: '<first@mail.gmail.com>',
@@ -59,6 +86,24 @@ describe('extractEmails', () => {
     assert.deepEqual(extractEmails(''), []);
     assert.deepEqual(extractEmails(undefined), []);
   });
+
+  it('prefers angle-addr over emails inside quoted display names', () => {
+    assert.deepEqual(extractEmails('"john@x.com via List" <list@y.com>'), ['list@y.com']);
+    assert.deepEqual(extractEmails('Contact "john@x.com" <list@y.com>'), ['list@y.com']);
+  });
+
+  it('does not capture stray quotes or brackets', () => {
+    assert.deepEqual(extractEmails('"<not-an-addr>"'), []);
+    assert.deepEqual(extractEmails('Name <mail@ondrejspulak.cz>'), ['mail@ondrejspulak.cz']);
+  });
+});
+
+describe('normalizeEmailForMatch', () => {
+  it('lowercases, strips plus-tags, and ignores gmail dots', () => {
+    assert.equal(normalizeEmailForMatch('Mail+Invoices@Ondrejspulak.cz'), 'mail@ondrejspulak.cz');
+    assert.equal(normalizeEmailForMatch('s.pulak.ondrej+tag@gmail.com'), 'spulakondrej@gmail.com');
+    assert.equal(normalizeEmailForMatch('S.Pulak.Ondrej@googlemail.com'), 'spulakondrej@gmail.com');
+  });
 });
 
 describe('prefixRe', () => {
@@ -70,14 +115,34 @@ describe('prefixRe', () => {
     assert.equal(prefixRe('  re : already'), 're : already');
     assert.equal(prefixRe(''), 'Re:');
     assert.equal(prefixRe('  Fw: x'), 'Re: Fw: x');
+    assert.equal(prefixRe('Odp: dotaz'), 'Re: Odp: dotaz');
+    assert.equal(prefixRe('AW: Frage'), 'Re: AW: Frage');
   });
 });
 
-describe('buildReferences', () => {
-  it('appends the parent Message-ID without duplicating it', () => {
-    assert.equal(buildReferences(undefined, '<a@x>'), '<a@x>');
+describe('extractMessageIds / buildReferences', () => {
+  it('keeps only <...> tokens and unfolds folded values', () => {
+    assert.deepEqual(extractMessageIds('<a@x>\r\n\t<b@x> extra'), ['<a@x>', '<b@x>']);
     assert.equal(buildReferences('<a@x>', 'b@x'), '<a@x> <b@x>');
     assert.equal(buildReferences('<a@x> <b@x>', '<b@x>'), '<a@x> <b@x>');
+  });
+
+  it('uses In-Reply-To when References is missing (RFC 5322 3.6.4)', () => {
+    assert.equal(buildReferences(undefined, '<orig@x>', '<prev@x>'), '<prev@x> <orig@x>');
+    assert.equal(buildReferences('<a@x>', '<orig@x>', '<prev@x>'), '<a@x> <orig@x>');
+  });
+});
+
+describe('encodeRfc2047', () => {
+  it('splits a long Czech subject into folded encoded-words under 998 chars', () => {
+    const czech = 'Příliš žluťoučký kůň úpěl ďábelské ódy '.repeat(8).trim();
+    const encoded = encodeRfc2047(czech);
+    assert.match(encoded, /=\?UTF-8\?B\?/);
+    assert.match(encoded, /\r\n /);
+    assert.equal(decodeEncodedWords(encoded), czech);
+    for (const line of `Subject: ${encoded}`.split('\r\n')) {
+      assert.ok(line.length <= 998, `line length ${line.length}`);
+    }
   });
 });
 
@@ -97,24 +162,19 @@ describe('formatMailbox', () => {
 describe('pickSendAsForReply', () => {
   const sendAs = [primary, alias, pending];
 
-  it('prefers Delivered-To over To and Cc', () => {
-    const chosen = pickSendAsForReply(sendAs, originalToAlias);
-    assert.equal(chosen?.sendAsEmail, 'mail@ondrejspulak.cz');
-  });
-
-  it('uses To when Delivered-To does not match a send-as', () => {
+  it('prefers the alias in To when Delivered-To is the primary gmail address', () => {
     const chosen = pickSendAsForReply(sendAs, {
       ...originalToAlias,
-      deliveredTo: 'someone-else@example.com',
+      deliveredTo: 'spulak.ondrej@gmail.com',
       to: 'mail@ondrejspulak.cz',
     });
     assert.equal(chosen?.sendAsEmail, 'mail@ondrejspulak.cz');
   });
 
-  it('uses Cc when To and Delivered-To do not match', () => {
+  it('uses Cc when To and Delivered-To do not match a non-default alias', () => {
     const chosen = pickSendAsForReply(sendAs, {
       ...originalToAlias,
-      deliveredTo: 'other@example.com',
+      deliveredTo: 'spulak.ondrej@gmail.com',
       to: 'client@example.com',
       cc: 'mail@ondrejspulak.cz',
     });
@@ -139,11 +199,33 @@ describe('pickSendAsForReply', () => {
     });
     assert.equal(chosen?.sendAsEmail, 'mail@ondrejspulak.cz');
   });
+
+  it('matches plus-tagged and dotted gmail addresses to sendAs', () => {
+    const plus = pickSendAsForReply(sendAs, {
+      ...originalToAlias,
+      deliveredTo: 'spulak.ondrej@gmail.com',
+      to: 'mail+invoices@ondrejspulak.cz',
+    });
+    assert.equal(plus?.sendAsEmail, 'mail@ondrejspulak.cz');
+
+    const dotted = pickSendAsForReply(sendAs, {
+      ...originalToAlias,
+      deliveredTo: '',
+      to: 's.pulak.ondrej+tag@googlemail.com',
+      cc: '',
+    });
+    assert.equal(dotted?.sendAsEmail, 'spulak.ondrej@gmail.com');
+  });
 });
 
 describe('findSendAs', () => {
   it('matches a listed alias case-insensitively and extracts from a mailbox', () => {
     const found = findSendAs([primary, alias], 'Ondrej <MAIL@ondrejspulak.cz>');
+    assert.equal(found.sendAsEmail, 'mail@ondrejspulak.cz');
+  });
+
+  it('matches plus-addressing against the canonical sendAs', () => {
+    const found = findSendAs([primary, alias], 'mail+tag@ondrejspulak.cz');
     assert.equal(found.sendAsEmail, 'mail@ondrejspulak.cz');
   });
 
@@ -155,9 +237,14 @@ describe('findSendAs', () => {
         assert.match(err.message, /unknown@example.com/);
         assert.match(err.message, /spulak.ondrej@gmail.com/);
         assert.match(err.message, /mail@ondrejspulak.cz/);
+        assert.equal(err.availableCount, 2);
         return true;
       },
     );
+  });
+
+  it('rejects an unverified send-as instead of letting Gmail rewrite From', () => {
+    assert.throws(() => findSendAs([primary, alias, pending], 'pending@ondrejspulak.cz'), UnverifiedSendAsError);
   });
 });
 
@@ -169,7 +256,7 @@ describe('resolveCompose', () => {
     );
     const mime = decodeRaw(resolved.raw);
     assert.equal(resolved.threadId, undefined);
-    assert.equal(resolved.fromAddress, undefined);
+    assert.equal(resolved.fromAddress, 'spulak.ondrej@gmail.com');
     assert.doesNotMatch(mime, /^From:/m);
     assert.doesNotMatch(mime, /^In-Reply-To:/m);
     assert.doesNotMatch(mime, /^References:/m);
@@ -188,6 +275,7 @@ describe('resolveCompose', () => {
     assert.equal(resolved.fromAddress, 'mail@ondrejspulak.cz');
     assert.match(mime, /^From: =\?UTF-8\?B\?.+\?= <mail@ondrejspulak.cz>/m);
     assert.match(mime, /^To: client@example.com/m);
+    assert.doesNotMatch(mime, /^Cc:/m);
     assert.match(mime, /^Subject: Re: Question about the quote/m);
     assert.match(mime, /^In-Reply-To: <orig@mail.gmail.com>/m);
     assert.match(mime, /^References: <first@mail.gmail.com> <orig@mail.gmail.com>/m);
@@ -246,8 +334,8 @@ describe('resolveCompose', () => {
     );
   });
 
-  it('defaults Reply-To over From for the recipient', () => {
-    const resolved = resolveCompose(
+  it('defaults Reply-To over From for the recipient, including multiple addresses', () => {
+    const single = resolveCompose(
       { body: 'x' },
       {
         requireRecipient: true,
@@ -255,7 +343,41 @@ describe('resolveCompose', () => {
         sendAs: [primary, alias],
       },
     );
-    assert.match(decodeRaw(resolved.raw), /^To: desk@example.com/m);
+    assert.match(decodeRaw(single.raw), /^To: desk@example.com/m);
+
+    const multi = resolveCompose(
+      { body: 'x' },
+      {
+        requireRecipient: true,
+        original: { ...originalToAlias, replyTo: 'desk@example.com, ops@example.com' },
+        sendAs: [primary, alias],
+      },
+    );
+    assert.match(decodeRaw(multi.raw), /^To: desk@example.com, ops@example.com/m);
+  });
+
+  it('when following up on mail this account sent, keeps that From and original To/Cc', () => {
+    const resolved = resolveCompose(
+      { body: 'one more thing' },
+      {
+        requireRecipient: true,
+        original: {
+          threadId: 'thread-sent',
+          from: 'Ondřej <mail@ondrejspulak.cz>',
+          to: 'Client <client@example.com>',
+          cc: 'Partner <partner@example.com>, mail@ondrejspulak.cz',
+          deliveredTo: 'spulak.ondrej@gmail.com',
+          subject: 'Proposal',
+          messageIdHeader: '<sent@mail.gmail.com>',
+        },
+        sendAs: [primary, alias],
+      },
+    );
+    const mime = decodeRaw(resolved.raw);
+    assert.equal(resolved.fromAddress, 'mail@ondrejspulak.cz');
+    assert.match(mime, /^To: client@example.com/m);
+    assert.match(mime, /^Cc: partner@example.com/m);
+    assert.doesNotMatch(mime, /Cc: .*mail@ondrejspulak\.cz/);
   });
 
   it('allows drafts without a recipient', () => {
@@ -288,6 +410,52 @@ describe('resolveCompose', () => {
     assert.equal(resolved.threadId, 'thread-abc');
     assert.doesNotMatch(mime, /^In-Reply-To:/m);
     assert.doesNotMatch(mime, /^References:/m);
+  });
+
+  it('normalizes folded References and fills them from In-Reply-To when missing', () => {
+    const folded = resolveCompose(
+      { body: 'x' },
+      {
+        requireRecipient: true,
+        original: {
+          ...originalToAlias,
+          references: '<a@x>\r\n\t<b@x>',
+          messageIdHeader: '<orig@mail.gmail.com>',
+        },
+        sendAs: [primary, alias],
+      },
+    );
+    assert.match(decodeRaw(folded.raw), /^References: <a@x> <b@x> <orig@mail.gmail.com>/m);
+
+    const fromInReplyTo = resolveCompose(
+      { body: 'x' },
+      {
+        requireRecipient: true,
+        original: {
+          ...originalToAlias,
+          references: '',
+          inReplyToHeader: '<prev@mail.gmail.com>',
+          messageIdHeader: '<orig@mail.gmail.com>',
+        },
+        sendAs: [primary, alias],
+      },
+    );
+    assert.match(decodeRaw(fromInReplyTo.raw), /^References: <prev@mail.gmail.com> <orig@mail.gmail.com>/m);
+  });
+
+  it('encodes a long Czech reply subject as folded RFC 2047 words', () => {
+    const czech = 'Příliš žluťoučký kůň úpěl ďábelské ódy '.repeat(6).trim();
+    const resolved = resolveCompose(
+      { subject: czech, body: 'x' },
+      { requireRecipient: true, original: originalToAlias, sendAs: [primary, alias] },
+    );
+    const value = headerValue(resolved.raw, 'Subject');
+    assert.match(value, /=\?UTF-8\?B\?/);
+    assert.match(value, /\r\n /);
+    assert.equal(decodeEncodedWords(value), `Re: ${czech}`);
+    for (const line of headerBlock(resolved.raw).split('\r\n')) {
+      assert.ok(line.length <= 998, `header line length ${line.length}`);
+    }
   });
 
   it('sets From on a new message when from is passed without a reply', () => {

@@ -9,6 +9,8 @@ import {
   listDrafts,
   searchMessages,
   sendMessage,
+  UnknownSendAsError,
+  UnverifiedSendAsError,
 } from './gmail.js';
 import { isReauthRequiredError } from './googleOAuth.js';
 import { log } from './logger.js';
@@ -70,9 +72,11 @@ const fromSchema = z
   );
 const replyToMessageIdSchema = messageIdSchema.describe(
   'Gmail message ID to reply to (from search_emails / get_email). Places this message in that ' +
-    'thread, sets In-Reply-To and References, prefixes Subject with "Re:" if needed, and sends ' +
-    'from the alias the original arrived at (unless from is set). to and subject default from ' +
-    'the original when omitted.',
+    'thread, sets In-Reply-To and References, prefixes Subject with English "Re:" if needed ' +
+    '(Odp:/AW:/Fwd: are not treated as Re:), and sends from the alias the original arrived at ' +
+    '(unless from is set). A reply to a received message goes to the sender only — not reply-all. ' +
+    'Following up on a message this account sent reuses that From alias and the original To/Cc. ' +
+    'to and subject default from the original when omitted.',
 );
 const draftIdSchema = z
   .string()
@@ -81,6 +85,17 @@ const draftIdSchema = z
 function writeFailure(operation: string, account: AccountRecord, err: unknown) {
   if (err instanceof GmailApiError && isReauthRequiredError(err)) {
     return errorResult(reauthMessage(account));
+  }
+  if (err instanceof UnknownSendAsError) {
+    log.error(`tool_${operation}_failed`, {
+      account: account.alias,
+      message: `unknown send-as (${err.availableCount} configured)`,
+    });
+    return errorResult(`${operation} failed for account "${account.alias}": ${err.message}`);
+  }
+  if (err instanceof UnverifiedSendAsError) {
+    log.error(`tool_${operation}_failed`, { account: account.alias, message: 'unverified send-as' });
+    return errorResult(`${operation} failed for account "${account.alias}": ${err.message}`);
   }
   log.error(`tool_${operation}_failed`, { account: account.alias, message: (err as Error).message });
   return errorResult(`${operation} failed for account "${account.alias}": ${(err as Error).message}`);
@@ -271,7 +286,8 @@ export function createMcpServer(): McpServer {
           'Sends a plain-text email from exactly the connected Gmail account named by account. The account alias is ' +
           'required and is never inferred or substituted. Without reply_to_message_id or from, Gmail sends from the ' +
           'account default send-as as before. Pass reply_to_message_id to reply in that thread from the alias the ' +
-          'original arrived at. Pass from to override From with a send-as alias. to is required unless replying.',
+          'original arrived at (reply to sender only, not reply-all). Pass from to override From with a verified ' +
+          'send-as alias. to is required unless replying.',
         inputSchema: {
           account: aliasSchema.describe('The alias of the connected Gmail account to send from.'),
           to: recipientSchema.optional().describe(
@@ -360,9 +376,9 @@ export function createMcpServer(): McpServer {
       {
         title: 'Delete a Gmail draft',
         description:
-          'Deletes one draft by draft ID in exactly the connected Gmail account named by account. This only ' +
-          'removes a draft — it cannot delete sent or received mail. The account alias is required and is never ' +
-          'inferred or substituted.',
+          'Permanently deletes one draft by draft ID in exactly the connected Gmail account named by account. ' +
+          'Gmail drafts.delete removes the draft outright (it is not moved to Trash). It cannot delete sent or ' +
+          'received mail. The account alias is required and is never inferred or substituted.',
         inputSchema: {
           account: aliasSchema.describe('The alias of the connected Gmail account that owns the draft.'),
           draft_id: draftIdSchema.describe('The Gmail draft ID, as returned by create_draft or list_drafts.'),

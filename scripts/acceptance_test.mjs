@@ -555,6 +555,7 @@ async function main() {
     record('send arrival + From identity', true, 'SKIPPED (SKIP_SEND=1)');
     record('reply stays in thread', true, 'SKIPPED (SKIP_SEND=1)');
     record('reply draft stays in thread', true, 'SKIPPED (SKIP_SEND=1)');
+    record('reply draft deleted', true, 'SKIPPED (SKIP_SEND=1)');
   } else {
     const sends = [
       { label: '9. send A->B', from: A, to: B },
@@ -636,8 +637,7 @@ async function main() {
         const ok =
           !reply.isError &&
           reply.parsed?.thread_id === arrivedOnB.threadId &&
-          typeof reply.parsed?.from === 'string' &&
-          reply.parsed.from.includes('@');
+          reply.parsed?.from === B.email;
         record(
           'reply stays in thread',
           ok,
@@ -667,17 +667,28 @@ async function main() {
           ok ? `draft_id ${draft.parsed.draft_id} thread_id ${draft.parsed.thread_id}` : (draft.text || '').slice(0, 160),
         );
         if (ok) {
-          await mcpCall(accessToken, 'tools/call', {
-            name: 'delete_draft',
-            arguments: { account: B.alias, draft_id: draft.parsed.draft_id },
-          });
+          const deleted = parseToolResult(
+            await mcpCall(accessToken, 'tools/call', {
+              name: 'delete_draft',
+              arguments: { account: B.alias, draft_id: draft.parsed.draft_id },
+            }),
+          );
+          record(
+            'reply draft deleted',
+            !deleted.isError && deleted.parsed?.deleted_draft_id === draft.parsed.draft_id,
+            !deleted.isError ? deleted.parsed.deleted_draft_id : (deleted.text || '').slice(0, 160),
+          );
+        } else {
+          record('reply draft deleted', false, 'reply draft was not created');
         }
       } catch (e) {
         record('reply draft stays in thread', false, e.message);
+        record('reply draft deleted', false, e.message);
       }
     } else if (!skipSend) {
       record('reply stays in thread', false, 'original message did not arrive on B; reply not attempted');
       record('reply draft stays in thread', false, 'original message did not arrive on B; reply draft not attempted');
+      record('reply draft deleted', false, 'original message did not arrive on B; reply draft not attempted');
     }
   }
 

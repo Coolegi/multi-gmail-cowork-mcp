@@ -34,7 +34,8 @@ a clear error — this server never silently substitutes a different account.
 
 ## What this is not
 
-Gmail only. No Calendar, Drive, Docs, Sheets, or Contacts. No permanent-delete tool. No
+Gmail only. No Calendar, Drive, Docs, Sheets, or Contacts. No tool that permanently
+deletes sent or received mail (`delete_draft` does permanently remove drafts). No
 shared backend, no central account, no telemetry.
 
 ## Privacy model — who can see your email
@@ -218,14 +219,18 @@ The deployed server exposes `create_draft`, `send_email`, `list_drafts`, and `de
 All require an explicit connected-account alias and never fall back to another account.
 Without new parameters, `send_email` still sends from Gmail's default send-as for that
 account (backwards compatible). Optional `reply_to_message_id` replies in the original
-thread (Gmail `threadId`, `In-Reply-To`, `References`, `Re:` subject) and sends from the
-alias the original arrived at, looked up via `users.settings.sendAs`. Optional `from`
-overrides that with a specific send-as alias; an unknown address is rejected. `delete_draft`
-removes only a draft, never sent or received mail. The tools use `gmail.modify`, not the
-broader `mail.google.com` scope, and listing send-as aliases is covered by that same grant
-(no extra OAuth scope). Claude connector permissions should allow read tools and
-`list_drafts` automatically while keeping `create_draft`, `send_email`, and `delete_draft`
-set to **Needs approval**.
+thread (Gmail `threadId`, `In-Reply-To`, `References`, English `Re:` subject — `Odp:`,
+`AW:`, and `Fwd:` are not treated as already-replied) and sends from the alias the
+original arrived at, looked up via `users.settings.sendAs`. A reply to a received
+message goes to the sender only (not reply-all). Following up on a message this account
+itself sent reuses that From alias and the original To/Cc. Optional `from` overrides
+From with a verified send-as alias; unknown or unverified addresses are rejected.
+`delete_draft` calls Gmail `drafts.delete`, which **permanently deletes the draft**
+(not move-to-Trash) and cannot delete sent or received mail. The tools use
+`gmail.modify`, not the broader `mail.google.com` scope, and listing send-as aliases is
+covered by that same grant (no extra OAuth scope). Claude connector permissions should
+allow read tools and `list_drafts` automatically while keeping `create_draft`,
+`send_email`, and `delete_draft` set to **Needs approval**.
 
 ## Updating and rotating
 

@@ -222,8 +222,9 @@ are long-lived.
 - `search_all_accounts` and `search_emails` cap results and return metadata/snippets, not
   full bodies, to keep tool responses small — but an authorized OAuth client can read every
   connected account's mail via `get_email`.
-- `delete_draft` removes only a Gmail draft. There is still no tool that permanently
-  deletes sent or received messages.
+- `delete_draft` calls Gmail `drafts.delete`, which permanently deletes that draft (it
+  is not moved to Trash). There is still no tool that permanently deletes sent or
+  received messages.
 - Dependencies are kept minimal by design (see README) but you are responsible for keeping
   them updated (`npm audit`, `npm outdated`) on your own deployment.
 
